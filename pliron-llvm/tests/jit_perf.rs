@@ -8,25 +8,13 @@
 
 #![cfg(feature = "llvm-sys")]
 
-use std::{fs, path::Path, process};
+use std::{fs, process};
 
 use pliron_llvm::llvm_sys::{
     core::{LLVMContext, LLVMModule},
     lljit::SimpleJIT,
 };
 use tempfile::tempdir;
-
-/// Recursively find the file named `name` under `dir`.
-fn find_file(dir: &Path, name: &str) -> Option<std::path::PathBuf> {
-    fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
-        let path = entry.path();
-        if path.is_dir() {
-            find_file(&path, name)
-        } else {
-            (entry.file_name() == name).then_some(path)
-        }
-    })
-}
 
 #[test]
 fn perf_listener_writes_jitdump() {
@@ -35,11 +23,11 @@ fn perf_listener_writes_jitdump() {
     unsafe { std::env::set_var("JITDUMPDIR", dump_dir.path()) };
 
     let context = LLVMContext::default();
-    let ir = r#"
+    let ir = r"
       define i32 @perf_add(i32 %a, i32 %b) {
           %sum = add i32 %a, %b
           ret i32 %sum
-      }"#;
+      }";
     let module = LLVMModule::from_ir_in_str(&context, ir, None).unwrap();
 
     let jit = match SimpleJIT::new_with_perf_listener(context, module) {
@@ -55,9 +43,16 @@ fn perf_listener_writes_jitdump() {
     };
     assert_eq!(add(2, 3), 5);
 
-    let dump_name = format!("jit-{}.dump", process::id());
-    let dump = find_file(dump_dir.path(), &dump_name).expect("No jitdump file written");
-    let contents = fs::read(dump).unwrap();
+    // LLVM writes `$JITDUMPDIR/.debug/jit/llvm-IR-jit-<date>-<random>/jit-<pid>.dump`.
+    // The dump directory is new, thus it holds only the directory of this process.
+    let run_dir = fs::read_dir(dump_dir.path().join(".debug/jit"))
+        .expect("No jitdump directory created")
+        .next()
+        .expect("No jitdump directory created")
+        .unwrap()
+        .path();
+    let dump = run_dir.join(format!("jit-{}.dump", process::id()));
+    let contents = fs::read(&dump).unwrap_or_else(|err| panic!("{}: {err}", dump.display()));
     assert!(
         contents
             .windows(b"perf_add".len())
