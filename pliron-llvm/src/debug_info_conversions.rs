@@ -1,44 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) The pliron contributors
 
-//! Conversion of op locations to LLVM debug data.
-
-/// Conversion of op locations to LLVM debug data, a companion to [crate::to_llvm_ir].
+/// Conversion of op locations to LLVM debug data, a companion to [`crate::to_llvm_ir`].
 ///
-/// Each function that has a location gets a `DISubprogram`.
-/// Each instruction in such a function gets a `DILocation`:
-/// - [Location::SrcPos] gives the line and the column.
-/// - [Location::Named] gives the location of its child. The name of the
-///   outermost frame of a location is the name of a function.
-/// - [Location::CallSite] gives the location of its callee, inlined at the
-///   location of its caller. The name of the outermost frame of the callee
-///   gives a `DISubprogram` for the callee. If the callee has no name, the
-///   conversion uses the location of the caller.
-/// - [Location::Fused] gives its first location that converts. The C-API
-///   cannot merge locations.
-/// - [Location::Unknown] gives line 0. Line 0 is code with no source line.
+/// The conversion maps each located function to a `DISubprogram` and each
+/// located op to a `DILocation` in that subprogram. Call site locations become
+/// inlined frames. The conversion is lossy: a `DILocation` holds one position,
+/// so the conversion keeps the first position of each location.
 ///
-/// A position in a file that is not the file of its scope gets a
-/// `DILexicalBlockFile`.
-///
-/// [Location::SrcPos]: pliron::location::Location::SrcPos
-/// [Location::Named]: pliron::location::Location::Named
-/// [Location::CallSite]: pliron::location::Location::CallSite
-/// [Location::Fused]: pliron::location::Location::Fused
-/// [Location::Unknown]: pliron::location::Location::Unknown
+/// Use [`convert_module_with_debug_info`](crate::to_llvm_ir::convert_module_with_debug_info)
+/// to get this data. [`DebugInfoOptions`](to_llvm_ir::DebugInfoOptions)
+/// controls the compile unit and the emission kind.
 pub mod to_llvm_ir {
     use alloc::string::{String, ToString};
 
     use llvm_sys::{LLVMModuleFlagBehavior, debuginfo::LLVMDWARFEmissionKind};
     use pliron::{
         builtin::op_interfaces::SymbolOpInterface,
-        context::Context,
+        context::{Context, Ptr},
         graph::walkers::{
             IRNode, WALKCONFIG_PREORDER_FORWARD,
             interruptible::{WalkResult, immutable::walk_op, walk_advance, walk_break},
         },
         location::{Located, Location, Source},
         op::Op,
+        operation::Operation,
         uniqued_any,
         utils::table::HMap,
     };
@@ -75,7 +61,7 @@ pub mod to_llvm_ir {
         Full,
     }
 
-    /// Options for [convert_module_with_debug_info](crate::to_llvm_ir::convert_module_with_debug_info).
+    /// Options for [`convert_module_with_debug_info`](crate::to_llvm_ir::convert_module_with_debug_info).
     #[derive(Debug)]
     #[non_exhaustive]
     pub struct DebugInfoOptions {
@@ -109,15 +95,18 @@ pub mod to_llvm_ir {
 
     /// State for converting op locations to LLVM debug data.
     ///
-    /// LLVM uniques the `DIFile`, `DILexicalBlockFile`, `DISubroutineType`
-    /// and `DILocation` nodes. Thus only the distinct nodes need a map here.
+    /// LLVM uniques `DILocation`s, so they need no map here.
     pub(crate) struct DIConversionContext {
         options: DebugInfoOptions,
         builder: LLVMDIBuilder,
         // The compile unit. It is created with the first subprogram.
         unit: Option<LLVMMetadata>,
-        // Subprograms of inlined functions, by name and file.
-        inlined: HMap<(String, LLVMMetadata), LLVMMetadata>,
+        // The `DIFile` of each source.
+        files: HMap<Source, LLVMMetadata>,
+        // The `DILexicalBlockFile` of each scope and file.
+        block_files: HMap<(LLVMMetadata, LLVMMetadata), LLVMMetadata>,
+        // Subprograms of inlined functions, by file and name.
+        inlined: HMap<LLVMMetadata, HMap<String, LLVMMetadata>>,
         // The subprogram of the current function.
         subprogram: Option<LLVMMetadata>,
     }
@@ -128,18 +117,22 @@ pub mod to_llvm_ir {
                 options,
                 builder: LLVMDIBuilder::new(module),
                 unit: None,
+                files: HMap::default(),
+                block_files: HMap::default(),
                 inlined: HMap::default(),
                 subprogram: None,
             }
         }
 
         /// The `DIFile` of `src`.
-        fn file(&self, ctx: &Context, src: &Source) -> LLVMMetadata {
-            let name = match src {
-                Source::File(key) => uniqued_any::get(ctx, *key).to_string_lossy().into_owned(),
-                Source::InMemory => "<in-memory>".to_string(),
-            };
-            llvm_di_builder_create_file(&self.builder, &name, &self.options.directory)
+        fn file(&mut self, ctx: &Context, src: &Source) -> LLVMMetadata {
+            *self.files.entry(*src).or_insert_with(|| {
+                let name = match src {
+                    Source::File(key) => uniqued_any::get(ctx, *key).to_string_lossy().into_owned(),
+                    Source::InMemory => "<in-memory>".to_string(),
+                };
+                llvm_di_builder_create_file(&self.builder, &name, &self.options.directory)
+            })
         }
 
         /// Create the compile unit in `file`, if it does not exist.
@@ -196,27 +189,34 @@ pub mod to_llvm_ir {
         }
 
         /// `scope`, or a lexical block of `scope` in the file of `src`.
-        fn scope_in_file(&self, ctx: &Context, scope: LLVMMetadata, src: &Source) -> LLVMMetadata {
+        fn scope_in_file(
+            &mut self,
+            ctx: &Context,
+            scope: LLVMMetadata,
+            src: &Source,
+        ) -> LLVMMetadata {
             let file = self.file(ctx, src);
             if llvm_di_scope_get_file(scope) == Some(file) {
-                scope
-            } else {
-                llvm_di_builder_create_lexical_block_file(&self.builder, scope, file, 0)
+                return scope;
             }
+            *self.block_files.entry((scope, file)).or_insert_with(|| {
+                llvm_di_builder_create_lexical_block_file(&self.builder, scope, file, 0)
+            })
         }
 
         /// The subprogram of an inlined callee, from its outermost name.
         fn inlined_subprogram(&mut self, ctx: &Context, callee: &Location) -> Option<LLVMMetadata> {
-            let callee = outermost(callee);
             let name = frame_name(callee)?;
             let (src, _) = frame_src_pos(callee).unwrap_or((Source::InMemory, 0));
             let file = self.file(ctx, &src);
-            let key = (name.to_string(), file);
-            if let Some(subprogram) = self.inlined.get(&key) {
+            if let Some(subprogram) = self.inlined.get(&file).and_then(|names| names.get(name)) {
                 return Some(*subprogram);
             }
             let subprogram = self.create_subprogram(name, "", file, 0, true);
-            self.inlined.insert(key, subprogram);
+            self.inlined
+                .entry(file)
+                .or_default()
+                .insert(name.to_string(), subprogram);
             Some(subprogram)
         }
 
@@ -264,18 +264,10 @@ pub mod to_llvm_ir {
 
     /// `value`, or 0 if `value` is negative.
     fn non_negative(value: i32) -> u32 {
-        value.max(0) as u32
+        u32::try_from(value).unwrap_or(0)
     }
 
-    /// The outermost frame of `loc`: the last caller of a call site chain.
-    fn outermost(mut loc: &Location) -> &Location {
-        while let Location::CallSite { caller, .. } = loc {
-            loc = caller;
-        }
-        loc
-    }
-
-    /// The first name in a frame.
+    /// The first name in the outermost frame of `loc`.
     fn frame_name(loc: &Location) -> Option<&str> {
         match loc {
             Location::Named { name, .. } => Some(name),
@@ -285,7 +277,7 @@ pub mod to_llvm_ir {
         }
     }
 
-    /// The first source position in a frame, as a source and a line.
+    /// The first source position in the outermost frame of `loc`, as a source and a line.
     fn frame_src_pos(loc: &Location) -> Option<(Source, u32)> {
         match loc {
             Location::SrcPos { src, pos } => Some((*src, non_negative(pos.line))),
@@ -307,15 +299,15 @@ pub mod to_llvm_ir {
             &mut (),
             &WALKCONFIG_PREORDER_FORWARD,
             func_op.get_operation(),
-            |ctx: &Context, _: &mut (), node: IRNode| -> WalkResult<Location> {
+            |ctx: &Context, _state: &mut (), node: IRNode| -> WalkResult<Location> {
                 let IRNode::Operation(op) = node else {
                     return walk_advance();
                 };
-                let loc = op.deref(ctx).loc();
-                if loc.is_unknown() {
+                let op = op.deref(ctx);
+                if op.loc_ref().is_unknown() {
                     walk_advance()
                 } else {
-                    walk_break(outermost(&loc).clone())
+                    walk_break(op.loc())
                 }
             },
         );
@@ -340,31 +332,31 @@ pub mod to_llvm_ir {
         let Some(loc) = function_location(ctx, func_op) else {
             return;
         };
-        let loc = outermost(&loc);
         let llvm_name = func_op
             .llvm_symbol_name(ctx)
             .unwrap_or_else(|| func_op.get_symbol_name(ctx).to_string());
-        let name = frame_name(loc).unwrap_or(&llvm_name);
+        let name = frame_name(&loc).unwrap_or(&llvm_name);
         let linkage_name = if name == llvm_name { "" } else { &llvm_name };
-        let (src, line) = frame_src_pos(loc).unwrap_or((Source::InMemory, 0));
+        let (src, line) = frame_src_pos(&loc).unwrap_or((Source::InMemory, 0));
         let file = di.file(ctx, &src);
         let subprogram = di.create_subprogram(name, linkage_name, file, line, false);
         llvm_set_subprogram(func_llvm, subprogram);
         di.subprogram = Some(subprogram);
     }
 
-    /// Set the location of the instructions that `loc` converts to.
+    /// Set the location of the instructions that `op` converts to.
     pub(crate) fn set_location(
         ctx: &Context,
         llvm_ctx: &LLVMContext,
         cctx: &mut ConversionContext,
-        loc: &Location,
+        op: Ptr<Operation>,
     ) {
         let Some(di) = cctx.di.as_mut() else {
             return;
         };
+        let op = op.deref(ctx);
         let di_loc = di.subprogram.map(|subprogram| {
-            di.translate(ctx, llvm_ctx, loc, subprogram, None)
+            di.translate(ctx, llvm_ctx, op.loc_ref(), subprogram, None)
                 .unwrap_or_else(|| {
                     llvm_di_builder_create_debug_location(llvm_ctx, 0, 0, subprogram, None)
                 })
@@ -377,7 +369,6 @@ pub mod to_llvm_ir {
         let Some(di) = cctx.di.take() else {
             return;
         };
-        llvm_set_current_debug_location2(&cctx.builder, None);
         if di.unit.is_some() {
             let int32 = llvm_int_type_in_context(llvm_ctx, 32);
             for (key, value) in [
